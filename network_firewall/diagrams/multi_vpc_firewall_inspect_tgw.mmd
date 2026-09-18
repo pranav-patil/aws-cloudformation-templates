@@ -1,0 +1,115 @@
+flowchart TB
+  %% Internet
+  Internet["🌐 Internet"]
+
+  %% Core Transit Gateway with 3 Route Tables
+  subgraph TGW_Core["Transit Gateway (ASN: 64512)"]
+    direction LR
+    TGW_SpokeA["Spoke A Route Table<br/>(0.0.0.0/0 → Inspection)"]
+    TGW_Inspection["Inspection Route Table<br/>(0.0.0.0/0 → Spoke B)"]
+    TGW_SpokeB["Spoke B Route Table<br/>(10.1.0.0/16 → Inspection)"]
+  end
+
+  %% Inspection VPC
+  subgraph InspectionVPC["🔒 Inspection VPC (100.64.0.0/16)"]
+    direction TB
+    I_TGW_Subnet["TGW Subnet (100.64.0.0/28)<br/>Route: 0.0.0.0/0 → Firewall VPC Endpoint"]
+    I_FW_Subnet["Firewall Subnet (100.64.0.16/28)<br/>Route: 0.0.0.0/0 → TGW"]
+
+    subgraph NetworkFirewall["ANFW-Lab-Firewall"]
+      direction TB
+      FW["AWS Network Firewall<br/>(VPC Endpoint)"]
+      FWPolicy["Firewall Policy:<br/>Inspection-Firewall-Policy"]
+      FW --> FWPolicy
+    end
+
+    I_FW_Subnet -.- FW
+  end
+
+  %% Spoke A VPC (Private)
+  subgraph SpokeA["🔴 Spoke A Private VPC (10.1.0.0/16)"]
+    direction TB
+    SA_TGW_Subnet["TGW Subnet (10.1.0.0/28)"]
+    SA_Workload_Subnet["Private Workload Subnet (10.1.1.0/24)<br/>Route: 0.0.0.0/0 → TGW<br/>No Public IPs"]
+    SA_EC2["🖥️ EC2 Instance (10.1.1.4)<br/>Private Only - No Public IP"]
+    SA_SG["Security Group:<br/>ICMP, HTTP, SSH"]
+    SA_Workload_Subnet --> SA_EC2
+    SA_EC2 -.- SA_SG
+  end
+
+  %% Spoke B VPC (Public)
+  subgraph SpokeB["🔵 Spoke B Public VPC (10.2.0.0/16)"]
+    direction TB
+    SB_TGW_Subnet["TGW Subnet (10.2.0.0/28)<br/>Route: 10.1.0.0/16 → TGW"]
+    SB_Workload_Subnet["Public Workload Subnet (10.2.1.0/24)<br/>Route: 0.0.0.0/0 → IGW<br/>Route: 10.1.0.0/16 → TGW"]
+    SB_EC2["🖥️ EC2 Instance (10.2.1.4)<br/>Has Public IP"]
+    SB_SG["Security Group:<br/>ICMP, HTTP, SSH"]
+    IGW["Internet Gateway<br/>IGW Route Table:<br/>10.1.0.0/16 → TGW"]
+    SB_Workload_Subnet --> SB_EC2
+    SB_EC2 -.- SB_SG
+  end
+
+  %% TGW attachments
+  TGW_SpokeA <-->|"Spoke A Attachment"| SA_TGW_Subnet
+  TGW_Inspection <-->|"Inspection Attachment"| I_TGW_Subnet
+  TGW_SpokeB <-->|"Spoke B Attachment"| SB_TGW_Subnet
+  
+  SpokeB --- IGW
+  IGW <--> Internet
+
+  %% ========== Traffic Flow 1: Private → Internet (Egress) ==========
+  SA_EC2 ==>|"①EGRESS: 0.0.0.0/0"| SA_TGW_Subnet
+  SA_TGW_Subnet ==>|"②Spoke A RT"| TGW_SpokeA
+  TGW_SpokeA ==>|"③0.0.0.0/0"| TGW_Inspection
+  TGW_Inspection ==>|"④Inspection Attach"| I_TGW_Subnet
+  I_TGW_Subnet ==>|"⑤0.0.0.0/0"| FW
+  FW ==>|"⑥Inspected"| I_FW_Subnet
+  I_FW_Subnet ==>|"⑦0.0.0.0/0"| TGW_Inspection
+  TGW_Inspection ==>|"⑧0.0.0.0/0"| TGW_SpokeB
+  TGW_SpokeB ==>|"⑨Spoke B Attach"| SB_TGW_Subnet
+  SB_TGW_Subnet ==>|"⑩Forward"| SB_Workload_Subnet
+  SB_Workload_Subnet ==>|"⑪0.0.0.0/0"| IGW
+  IGW ==>|"⑫NAT"| Internet
+
+  %% ========== Traffic Flow 2: Internet → Private (Ingress) ==========
+  Internet -.->|"❶INGRESS: 10.1.0.0/16"| IGW
+  IGW -.->|"❷IGW RT: 10.1.0.0/16"| TGW_SpokeB
+  TGW_SpokeB -.->|"❸Spoke B RT: 10.1.0.0/16"| TGW_Inspection
+  TGW_Inspection -.->|"❹Inspection Attach"| I_TGW_Subnet
+  I_TGW_Subnet -.->|"❺0.0.0.0/0"| FW
+  FW -.->|"❻Inspected"| I_FW_Subnet
+  I_FW_Subnet -.->|"❼0.0.0.0/0"| TGW_Inspection
+  TGW_Inspection -.->|"❽0.0.0.0/0"| TGW_SpokeB
+  TGW_SpokeB -.->|"❾Spoke B RT"| TGW_SpokeA
+  TGW_SpokeA -.->|"❿Spoke A Attach"| SA_TGW_Subnet
+  SA_TGW_Subnet -.->|"⓫Forward"| SA_Workload_Subnet
+  SA_Workload_Subnet -.->|"⓬Deliver"| SA_EC2
+
+  %% ========== Traffic Flow 3: East-West (Spoke A ↔ Spoke B) ==========
+  SA_EC2 ~~~|"EAST-WEST via same path"| SB_EC2
+
+  %% Logging
+  subgraph Logging["☁️ CloudWatch Logging"]
+    direction TB
+    CWFlow["Log Group:<br/>inspection-fw/flow"]
+    CWAlert["Log Group:<br/>inspection-fw/alert"]
+  end
+  FW --> CWFlow
+  FW --> CWAlert
+
+  %% Stateful Rule Group
+  SRG["Stateful Rule Group:<br/>ICMP-Alert-Rule-Group<br/>(Capacity: 100, ALERT only)"]
+  SRG -.- FWPolicy
+
+  %% Styling
+  classDef privateVPC fill:#ffe6e6,stroke:#ff4444,stroke-width:3px
+  classDef publicVPC fill:#e6f3ff,stroke:#4444ff,stroke-width:3px
+  classDef inspectionVPC fill:#fff4e6,stroke:#ff9944,stroke-width:3px
+  classDef firewall fill:#ffcccc,stroke:#cc0000,stroke-width:4px
+  classDef tgwRT fill:#e6ffe6,stroke:#44aa44,stroke-width:2px
+  
+  class SpokeA privateVPC
+  class SpokeB publicVPC
+  class InspectionVPC inspectionVPC
+  class NetworkFirewall,FW firewall
+  class TGW_SpokeA,TGW_Inspection,TGW_SpokeB tgwRT

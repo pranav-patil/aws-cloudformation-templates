@@ -1,0 +1,677 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS Network Firewall - Single VPC Transit Model with Cross-Subnet Inspection and Traffic Generator"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: EmproviseZyronCloudIPS
+  ScriptsBucket:
+    Type: String
+    Description: S3 bucket containing malware traffic generator scripts for traffic replay.
+  VPCCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC.
+  ProtectedSubnetACIDR:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR for the Protected Subnet (where instance A resides).
+  PublicSubnetBCIDR:
+    Type: String
+    Default: 10.0.3.0/24
+    Description: CIDR for the Public/Unprotected Subnet (where instance B resides).
+  FirewallSubnetACIDR:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR for the Network Firewall Endpoint Subnet.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for both instances.
+  AMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/jammy/stable/current/amd64/hvm/ebs-gp2/ami-id
+    Description: Latest Ubuntu 22.04 LTS (Jammy Jellyfish) from Systems Manager Parameter Store
+
+Resources:
+
+  # --- 1. VPC and Networking Resources ---
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-nfw-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # --- 2. Subnets ---
+  ProtectedSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref ProtectedSubnetACIDR
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-private-protected-subnet-a
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetBCIDR
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-public-unprotected-subnet-b
+
+  FirewallSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref FirewallSubnetACIDR
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub: ${ProjectName}-firewall-subnet-a
+
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-nat-eip
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-nat-gateway
+
+  # --- 3. Network Firewall and Endpoint ---
+
+  FirewallPolicy:
+    Type: AWS::NetworkFirewall::FirewallPolicy
+    Properties:
+      FirewallPolicyName:
+        Fn::Sub: network-firewall-policy-${ProjectName}
+      Description: Network firewall policy to control internet egress and ingress
+      FirewallPolicy:
+        StatefulEngineOptions: 
+          RuleOrder: STRICT_ORDER
+          StreamExceptionPolicy: REJECT
+        StatefulRuleGroupReferences:
+          - ResourceArn: !Sub arn:aws:network-firewall:${AWS::Region}:aws-managed:stateful-rulegroup/ThreatSignaturesBotnetActionOrder
+            Priority: 1
+        StatelessDefaultActions:
+          - aws:forward_to_sfe
+        StatelessFragmentDefaultActions:
+          - aws:forward_to_sfe
+        PolicyVariables:
+          RuleVariables:
+            HOME_NET:
+              Definition:
+                - 10.0.0.0/8
+                - 172.16.0.0/12
+                - 192.168.0.0/16
+
+  NetworkFirewall:
+    Type: AWS::NetworkFirewall::Firewall
+    DependsOn:
+      - FirewallPolicy
+      - FirewallSubnetA
+    Properties:
+      FirewallName: NFW-Main-Firewall
+      VpcId: !Ref VPC
+      FirewallPolicyArn: !Ref FirewallPolicy
+      DeleteProtection: false
+      FirewallPolicyChangeProtection: false
+      SubnetChangeProtection: false
+      SubnetMappings:
+        - SubnetId: !Ref FirewallSubnetA
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-network-firewall
+
+  FirewallLogFlowGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/network-firewall/egress-inspection/${AWS::Region}/flow
+
+  FirewallLogAlertGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/network-firewall/egress-inspection/${AWS::Region}/alert
+
+  FirewallLogConfiguration:
+    Type: AWS::NetworkFirewall::LoggingConfiguration
+    Properties:
+      FirewallArn: !Ref NetworkFirewall
+      LoggingConfiguration:
+        LogDestinationConfigs:
+          - LogType: FLOW
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: !Ref FirewallLogFlowGroup
+          - LogType: ALERT
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: !Ref FirewallLogAlertGroup
+
+  # --- 4. Route Tables and Routing Logic ---
+
+  # A. Route Table for the Protected Subnet (Outbound/Egress Traffic)
+  ProtectedSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-protected-egress-rt
+
+  AttachProtectedSubnetRT:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ProtectedSubnetA
+      RouteTableId: !Ref ProtectedSubnetRouteTable
+
+  # Route 1: Default Egress (Internet traffic) from Protected Subnet -> NFW Endpoint
+  ProtectedSubnetEgressRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref ProtectedSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      VpcEndpointId: !Select ["1", !Split [":", !Select ["0", !GetAtt NetworkFirewall.EndpointIds]]]
+
+  # Route 1b: Traffic from Protected Subnet to Public Subnet -> NFW Endpoint (FOR INSPECTION)
+  ProtectedToPublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref ProtectedSubnetRouteTable
+      DestinationCidrBlock: !Ref PublicSubnetBCIDR
+      VpcEndpointId: !Select ["1", !Split [":", !Select ["0", !GetAtt NetworkFirewall.EndpointIds]]]
+
+  # B. Route Table for the Public/Unprotected Subnet (Instance B)
+  PublicSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-public-unprotected-rt
+
+  AttachPublicSubnetRT:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicSubnetRouteTable
+
+  # Route 2: Default Egress (Internet traffic) from Public Subnet -> IGW (UNPROTECTED)
+  PublicSubnetInternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Crucial Route 3: Traffic destined for Protected Subnet (10.0.1.0/24) -> NFW Endpoint (FOR INSPECTION)
+  PublicToProtectedRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicSubnetRouteTable
+      DestinationCidrBlock: !Ref ProtectedSubnetACIDR
+      VpcEndpointId: !Select ["1", !Split [":", !Select ["0", !GetAtt NetworkFirewall.EndpointIds]]]
+
+  # C. Route Table for the Internet Gateway (Inbound/Ingress Traffic) - Routes to NFW
+  IGWRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-igw-ingress-rt
+
+  AttachIGWRouteTable:
+    Type: AWS::EC2::GatewayRouteTableAssociation
+    DependsOn: AttachGateway
+    Properties:
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref IGWRouteTable
+
+  # Route 4: Default Ingress (Internet traffic) from IGW -> NFW Endpoint
+  IGWIngressRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref IGWRouteTable
+      DestinationCidrBlock: !Ref ProtectedSubnetACIDR
+      VpcEndpointId: !Select ["1", !Split [":", !Select ["0", !GetAtt NetworkFirewall.EndpointIds]]]
+
+  # D. Route Table for the Firewall Subnet (Forwarding Inspected Traffic)
+  FirewallSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-firewall-rt
+
+  AttachFirewallSubnetRT:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref FirewallSubnetA
+      RouteTableId: !Ref FirewallSubnetRouteTable
+
+  # Route 5: Inspected Traffic to the Internet -> NAT Gateway
+  FirewallSubnetForwardInternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref FirewallSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  # --- 5. Security Group for EC2 Instances ---
+  InstanceBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: InstanceSG
+      GroupDescription: Allow SSH and ICMP from anywhere in the VPC
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 8080
+        ToPort: 8080
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: icmp
+        FromPort: -1
+        ToPort: -1
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-sec-group
+
+  InstanceASecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: InstanceA-VPC-Only-SG
+      GroupDescription: Allow all traffic from within the VPC only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          CidrIp: !Ref VPCCIDR
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-instance-a-sec-group
+
+  ApplicationKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: generated-key
+      KeyType: rsa
+      KeyFormat: pem
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-key-pair
+
+  #role for EC2 instances for systems manager
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-EC2InstanceRole"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      # The managed policy to allows the EC2 access to SSM permissions
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3ScriptBucketAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub "arn:aws:s3:::${ScriptsBucket}"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: 
+                  - !Sub "arn:aws:s3:::${ScriptsBucket}/*"
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2InstanceRole
+  
+  # --- 6. EC2 Instances ---
+  # Instance A - Protected in Private Subnet
+  EC2InstanceA:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - NetworkFirewall
+      - FirewallSubnetRouteTable
+      - FirewallPolicy
+    Properties:
+      ImageId: !Ref AMI
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref ApplicationKeyPair
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeviceIndex: 0
+          GroupSet: [!Ref InstanceASecurityGroup]
+          SubnetId: !Ref ProtectedSubnetA
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub: ${ProjectName}-Instance-A-Protected
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+
+          echo "Waiting for internet connectivity..."
+          # Loop up to 30 times, waiting 10 seconds each time (5 minutes max)
+          for i in {1..30}; do
+              if curl -s -I http://us-east-1.ec2.archive.ubuntu.com > /dev/null; then
+                  echo "Internet connection established."
+                  break
+              else
+                  echo "Waiting for network... ($i/30)"
+                  sleep 10
+              fi
+          done
+
+          echo "Starting Instance A setup at $(date)"
+
+          apt-get update -y
+          apt-get install -y python3 python3-pip python3-venv awscli
+
+          MOCK_SERVER_DIR="/home/ubuntu/mock_server"
+          mkdir -p "$MOCK_SERVER_DIR"
+          cd "$MOCK_SERVER_DIR"
+
+          pip3 install fastapi uvicorn
+
+          cat <<EOF > main.py
+          from fastapi import FastAPI, Request
+          from datetime import datetime
+
+          app = FastAPI()
+
+          @app.api_route("/{path_name:path}", methods=["GET", "POST", "PUT", "DELETE"])
+          async def catch_all(request: Request, path_name: str):
+              return {
+                  "status": "success",
+                  "message": "Mock response for Suricata testing",
+                  "path": f"/{path_name}",
+                  "method": request.method,
+                  "timestamp": datetime.now().isoformat()
+              }
+          EOF
+
+          chown -R ubuntu:ubuntu "$MOCK_SERVER_DIR"
+
+          echo "Step 3: Creating systemd service..."
+          cat <<EOF > /etc/systemd/system/mock-http-server.service
+          [Unit]
+          Description=FastAPI Mock Server
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=$MOCK_SERVER_DIR
+          Environment="MOCK_PORT=80"
+          Environment="MOCK_LOG_FILE=/var/log/mock-server.log"
+          ExecStart=/usr/local/bin/uvicorn main:app --host 0.0.0.0 --port 80
+          Restart=always
+          RestartSec=10
+          StandardOutput=append:/var/log/mock-server.log
+          StandardError=append:/var/log/mock-server.log
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable mock-http-server.service
+          systemctl start mock-http-server.service
+
+          sleep 10
+          systemctl is-active --quiet mock-http-server.service && echo "SUCCESS" || exit 1
+
+  # Instance B - Unprotected in Public Subnet
+  EC2InstanceB:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - EC2InstanceA
+    Properties:
+      ImageId: !Ref AMI
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref ApplicationKeyPair
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet: [!Ref InstanceBSecurityGroup]
+          SubnetId: !Ref PublicSubnetB
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub: ${ProjectName}-Instance-B-Unprotected
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -o pipefail
+
+          # Setup logging: redirect all output to both console and log file
+          LOG_FILE="/var/log/traffic-generator.log"
+          exec > >(tee -a $LOG_FILE) 2>&1
+
+          echo "--- Starting Instance B setup: $(date) ---"
+
+          # 1. Install Dependencies
+          apt-get update -y
+          apt-get install -y python3-pip python3-requests curl dnsutils
+
+          TARGET_IP="${EC2InstanceA.PrivateIp}"
+          echo "Executing scripts against Target: $TARGET_IP"
+
+          echo "Waiting for private EC2 instance (http://$TARGET_IP) to be ready..."
+          MAX_RETRIES=300
+          COUNT=0
+          while [ $COUNT -lt $MAX_RETRIES ]; do
+              HTTP_STATUS=$(curl -s -L -o /dev/null -w '%{http_code}' http://$TARGET_IP/ 2>/dev/null || echo "000")
+              
+              if [ "$HTTP_STATUS" = "200" ]; then
+                  echo "Private EC2 instance is ready!"
+                  break
+              fi
+              
+              COUNT=$((COUNT + 1))
+              echo "Attempt $COUNT/$MAX_RETRIES: Retrying connection to Private EC2 Instance in 10s..."
+              sleep 10
+          done
+
+          if [ $COUNT -eq $MAX_RETRIES ]; then
+              echo "Error: Private EC2 Instance failed to become ready in time."
+              exit 1
+          fi
+
+          # 3. Create Python Threat Simulation Script
+          cat << 'EOF' > /home/ubuntu/generate_threat_traffic.py
+          import sys
+          import time
+          import socket
+          import requests
+
+          target_ip = sys.argv[1]
+          target_url = f"http://{target_ip}"
+
+          # EICAR standard anti-virus/malware test string
+          EICAR_STRING = r'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*'
+
+          # Known signatures targeted by ThreatSignatures Managed Rulegroups
+          KNOWN_BAD_USER_AGENTS = [
+              "Nikto",
+              "sqlmap/1.0",
+              "Wget/1.9+cvs-stable",
+              "Zeus",
+              "BlackSun",
+              "Mozilla/5.0 (Windows NT 6.1; Win64; x64) CobaltStrike"
+          ]
+
+          SUSPICIOUS_PATHS = [
+              "/cmd.exe",
+              "/etc/passwd",
+              "/.env",
+              "/shell?cmd=cat%20/etc/passwd",
+              "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php"
+          ]
+
+          DNS_TEST_DOMAINS = [
+              "eicar.org",
+              "testmyids.com"
+          ]
+
+          def trigger_eicar_payload():
+              print("[+] Sending EICAR malware payload via POST request...")
+              try:
+                  res = requests.post(target_url, data={"file": EICAR_STRING}, timeout=5)
+                  print(f"    EICAR POST status: {res.status_code}")
+              except Exception as e:
+                  print(f"    EICAR request triggered block/error: {e}")
+
+          def trigger_malicious_user_agents():
+              print("[+] Injecting known threat User-Agent signatures...")
+              for ua in KNOWN_BAD_USER_AGENTS:
+                  try:
+                      headers = {"User-Agent": ua}
+                      res = requests.get(target_url, headers=headers, timeout=5)
+                      print(f"    User-Agent '{ua}' status: {res.status_code}")
+                  except Exception as e:
+                      print(f"    User-Agent '{ua}' triggered block/error: {e}")
+
+          def trigger_exploit_paths():
+              print("[+] Testing exploit paths targeted by ThreatSignatures rules...")
+              for path in SUSPICIOUS_PATHS:
+                  try:
+                      res = requests.get(f"{target_url}{path}", timeout=5)
+                      print(f"    Path '{path}' status: {res.status_code}")
+                  except Exception as e:
+                      print(f"    Path '{path}' triggered block/error: {e}")
+
+          def trigger_dns_queries():
+              print("[+] Triggering malicious DNS lookups...")
+              for domain in DNS_TEST_DOMAINS:
+                  try:
+                      socket.gethostbyname(domain)
+                      print(f"    DNS Lookup for {domain} succeeded.")
+                  except Exception as e:
+                      print(f"    DNS Lookup for {domain} failed: {e}")
+
+          if __name__ == "__main__":
+              print(f"--- Starting Threat Traffic Simulation against {target_ip} ---")
+              # Run 3 iterative cycles to ensure rules fire consistently in firewall logs
+              for cycle in range(1, 4):
+                  print(f"\n--- Simulation Cycle {cycle} ---")
+                  trigger_eicar_payload()
+                  trigger_malicious_user_agents()
+                  trigger_exploit_paths()
+                  trigger_dns_queries()
+                  time.sleep(2)
+              print("\n--- Simulation Complete ---")
+          EOF
+
+          # 4. Execute the Script
+          chown ubuntu:ubuntu /home/ubuntu/generate_threat_traffic.py
+          python3 /home/ubuntu/generate_threat_traffic.py "$TARGET_IP"
+
+          echo "--- Setup Complete: $(date) ---"
+
+# --- 7. Outputs ---
+Outputs:
+  VPCId:
+    Description: The ID of the new VPC.
+    Value: !Ref VPC
+  ProtectedSubnetId:
+    Description: Subnet where your application instances (e.g., Instance A) should reside.
+    Value: !Ref ProtectedSubnetA
+  PublicSubnetId:
+    Description: Subnet where your unprotected instances (e.g., Instance B) should reside.
+    Value: !Ref PublicSubnetB
+  EC2InstanceAPrivateIP:
+    Description: Private IP of EC2 Instance A (Target)
+    Value: !GetAtt EC2InstanceA.PrivateIp
+  EC2InstanceBPublicIP:
+    Description: Public IP of EC2 Instance B (Source)
+    Value: !GetAtt EC2InstanceB.PublicIp
+  KeyName:
+    Description: Name of the created key pair
+    Value: !Ref ApplicationKeyPair
+  SSMParameterName:
+    Description: Name of the SSM Parameter holding the private key.
+    Value: !Sub "/ec2/keypair/${ApplicationKeyPair.KeyPairId}"
+  MockServerServiceCommand:
+    Description: Command to check mock HTTP server service status on Instance A
+    Value: "ssh -i <key-file> ubuntu@<instance-a-private-ip> 'sudo systemctl status mock-http-server.service'"

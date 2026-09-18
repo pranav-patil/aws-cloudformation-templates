@@ -1,0 +1,15 @@
+{
+  "provider": "ollama",
+  "model": "qwen2.5-coder",
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:11434/v1",
+    "ANTHROPIC_AUTH_TOKEN": "ollama",
+    "ANTHROPIC_API_KEY": "",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
+  },
+  "permissions": {
+    "allow": [
+      "mcp__aws-knowledge-mcp-server__aws___search_documentation"
+    ]
+  }
+}

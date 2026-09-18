@@ -1,0 +1,373 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'VPC, WAF, ALB, Private Web App EC2, and Public Attacker EC2'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: EmproviseZyronCloudWAFDemo
+
+Resources:
+  # ==========================================
+  # KEY PAIR
+  # ==========================================
+  ApplicationKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub ${ProjectName}-generated-key
+      KeyType: rsa
+      KeyFormat: pem
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-key-pair
+
+  # ==========================================
+  # NETWORKING (VPC, Subnets, IGW, NAT)
+  # ==========================================
+  LabVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: WAF-Lab-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LabVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: 10.0.3.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [1, !GetAZs '']
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: 10.0.2.0/24
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LabVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LabVPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ==========================================
+  # SECURITY GROUPS
+  # ==========================================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP to ALB
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  PrivateInstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from ALB and SSH from Public Subnet
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/16 # Allow SSH from within VPC
+
+  AttackerInstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH access to attacker machine
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0 # Restrict this to your IP in a real scenario
+
+  # ==========================================
+  # ALB & WAF CONFIGURATION
+  # ==========================================
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets: 
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref LabVPC
+      TargetType: instance
+      Targets:
+        - Id: !Ref PrivateVictimInstance
+          Port: 80
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+  
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {} # Default to allow if no rules match
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: LabWAFMetrics
+      Rules:
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 0
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          # Managed rules require 'OverrideAction' instead of 'Action'
+          OverrideAction:
+            None: {} 
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: SQLiRuleMetric
+
+  WAFALBAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref ApplicationLoadBalancer
+      WebACLArn: !GetAtt WebACL.Arn
+
+  # ==========================================
+  # EC2 INSTANCES
+  # ==========================================
+  PrivateVictimInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: NatGateway
+    Properties:
+      InstanceType: t3.micro
+      ImageId: ami-04b70fa74e45c3917 # Ubuntu 24.04 us-east-1 (Update based on your region)
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref PrivateInstanceSG
+      KeyName: !Ref ApplicationKeyPair
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y nginx mysql-server python3-pip python3-flask python3-mysql.connector python3-gunicorn
+
+          # Setup MySQL Database
+          systemctl start mysql
+          mysql -e "CREATE DATABASE webapp;"
+          mysql -e "CREATE TABLE webapp.messages (requestId VARCHAR(255), message TEXT, userId VARCHAR(255));"
+          mysql -e "CREATE USER 'appuser'@'localhost' IDENTIFIED BY 'Password123!';"
+          mysql -e "GRANT ALL PRIVILEGES ON webapp.* TO 'appuser'@'localhost';"
+
+          # Create Flask App
+          mkdir -p /opt/webapp
+          cat << 'EOF' > /opt/webapp/app.py
+          from flask import Flask, request, jsonify
+          import mysql.connector
+
+          app = Flask(__name__)
+
+          def get_db():
+              return mysql.connector.connect(host="localhost", user="appuser", password="Password123!", database="webapp")
+
+          @app.route('/messages', methods=['POST'])
+          def post_message():
+              data = request.json
+              user_id = request.headers.get('userId')
+              if not user_id or not data: return jsonify({"error": "Missing data"}), 400
+              
+              db = get_db()
+              cursor = db.cursor()
+              # Intentionally vulnerable to SQLi for testing if desired, or use parameterized queries.
+              # Parameterized: cursor.execute("INSERT INTO messages (requestId, message, userId) VALUES (%s, %s, %s)", (data.get('requestId'), data.get('message'), user_id))
+              cursor.execute(f"INSERT INTO messages (requestId, message, userId) VALUES ('{data.get('requestId')}', '{data.get('message')}', '{user_id}')")
+              db.commit()
+              db.close()
+              return jsonify({"status": "Success"}), 201
+
+          @app.route('/messages', methods=['GET'])
+          def get_messages():
+              user_id = request.headers.get('userId')
+              db = get_db()
+              cursor = db.cursor(dictionary=True)
+              # Intentionally vulnerable to SQLi
+              cursor.execute(f"SELECT * FROM messages WHERE userId = '{user_id}'")
+              results = cursor.fetchall()
+              db.close()
+              return jsonify(results), 200
+
+          if __name__ == '__main__':
+              app.run(host='127.0.0.1', port=5000)
+          EOF
+
+          # Setup Gunicorn service
+          cat << 'EOF' > /etc/systemd/system/webapp.service
+          [Unit]
+          Description=Gunicorn instance to serve webapp
+          After=network.target
+          [Service]
+          User=root
+          WorkingDirectory=/opt/webapp
+          ExecStart=/usr/bin/gunicorn3 --workers 3 --bind 127.0.0.1:5000 app:app
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl start webapp
+          systemctl enable webapp
+
+          # Configure Nginx as Reverse Proxy
+          cat << 'EOF' > /etc/nginx/sites-available/default
+          server {
+              listen 80;
+              location / {
+                  proxy_pass http://127.0.0.1:5000;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+          }
+          EOF
+          systemctl restart nginx
+
+  PublicAttackerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: ami-04b70fa74e45c3917 # Ubuntu 24.04 us-east-1 (Update based on your region)
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref AttackerInstanceSG
+      KeyName: !Ref ApplicationKeyPair
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt-get update
+          apt-get install -y jq curl
+
+          cat << 'EOF' > /home/ubuntu/test_waf.sh
+          #!/bin/bash
+          TARGET_URL="http://${ApplicationLoadBalancer.DNSName}"
+
+          echo "--- 1. Sending Legitimate POST Request ---"
+          curl -s -o /dev/null -w "%{http_code}\n" -X POST "$TARGET_URL/messages" \
+            -H "userId: legitimate_user" \
+            -H "Content-Type: application/json" \
+            -d '{"requestId": "req_001", "message": "This is a normal message."}'
+
+          echo -e "\n--- 2. Sending Malicious POST Request (SQLi in Body) ---"
+          curl -s -o /dev/null -w "%{http_code}\n" -X POST "$TARGET_URL/messages" \
+            -H "userId: legitimate_user" \
+            -H "Content-Type: application/json" \
+            -d '{"requestId": "req_002", "message": "hello DROP TABLE messages; --"}'
+
+          echo -e "\n--- 3. Sending Malicious GET Request (SQLi in Header) ---"
+          curl -s -o /dev/null -w "%{http_code}\n" -X GET "$TARGET_URL/messages" \
+            -H "userId: admin' OR '1'='1"
+
+          EOF
+          
+          chmod +x /home/ubuntu/test_waf.sh
+          chown ubuntu:ubuntu /home/ubuntu/test_waf.sh
+
+Outputs:
+  ALBEndpoint:
+    Description: Use this URL to access the Web Application
+    Value: !Join ['', ['http://', !GetAtt ApplicationLoadBalancer.DNSName]]
+  AttackerIP:
+    Description: SSH into this IP to run the testing script
+    Value: !GetAtt PublicAttackerInstance.PublicIp
+  SSMParameterName:
+    Description: Name of the SSM Parameter holding the private key.
+    Value: !Sub "/ec2/keypair/${ApplicationKeyPair.KeyPairId}"

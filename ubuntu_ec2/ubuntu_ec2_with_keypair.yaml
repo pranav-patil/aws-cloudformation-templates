@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Ubuntu 22.04 LTS EC2 instance with auto-generated key pair stored in SSM Parameter Store"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: UbuntuEC2Demo
+    Description: Project name used for naming resources.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: ID of the existing VPC to deploy the instance into.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of the existing public subnet to deploy the instance into.
+
+  InstanceType:
+    Type: String
+    Default: t3.large
+    Description: EC2 instance type.
+
+  AMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/jammy/stable/current/amd64/hvm/ebs-gp2/ami-id
+    Description: Latest Ubuntu 22.04 LTS (Jammy Jellyfish) from Systems Manager Parameter Store.
+
+Resources:
+
+  # --- Key Pair ---
+  ApplicationKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub ${ProjectName}-generated-key
+      KeyType: rsa
+      KeyFormat: pem
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-key-pair
+
+  # --- IAM Role and Instance Profile ---
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-EC2InstanceRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # --- Security Group ---
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-sg
+      GroupDescription: Security group for Ubuntu EC2 - SSH and RDP access from internet
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH access from anywhere
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: 0.0.0.0/0
+          Description: RDP access from anywhere
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+          Description: ICMP for connectivity testing
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-sg
+
+  # --- EC2 Instance ---
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AMI
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref ApplicationKeyPair
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref InstanceSecurityGroup
+          SubnetId: !Ref SubnetId
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-instance
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+          
+          echo "Waiting for internet connectivity..."
+          # Loop up to 30 times, waiting 10 seconds each time (5 minutes max)
+          for i in {1..30}; do
+              if curl -s -I http://us-east-1.ec2.archive.ubuntu.com > /dev/null; then
+                  echo "Internet connection established."
+                  break
+              else
+                  echo "Waiting for network... ($i/30)"
+                  sleep 10
+              fi
+          done
+
+          echo "Starting Ubuntu EC2 setup at $(date)"
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update -y
+          apt-get upgrade -y
+          apt-get install -y ubuntu-desktop
+
+          apt-get install -y \
+            firefox gnome-terminal gedit nautilus gnome-calculator \
+            gnome-system-monitor file-roller evince eog net-tools \
+            curl wget vim htop git unzip ca-certificates python3 \
+            python3-pip openssl xrdp
+
+          # Setup xrdp for remote desktop access
+          systemctl enable xrdp
+          systemctl start xrdp
+
+          # Configure xrdp to use GNOME
+          echo "gnome-session" > /etc/skel/.xsession
+
+          # Add ubuntu user to ssl-cert group for xrdp
+          usermod -a -G ssl-cert xrdp
+
+          # Download AWS CLI v2
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          ./aws/install
+
+          systemctl restart xrdp
+
+          echo "ubuntu:mysecret" | chpasswd
+
+          wget -q -O /tmp/google-chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          apt-get install -y /tmp/google-chrome.deb || apt-get install -f -y
+          rm -f /tmp/google-chrome.deb
+
+          apt-get install -y \
+            openssh-server net-tools curl wget vim htop awscli
+
+          echo "Ubuntu EC2 setup completed at $(date)"
+
+# --- Outputs ---
+Outputs:
+  InstancePublicIP:
+    Description: Public IP address of the EC2 instance.
+    Value: !GetAtt EC2Instance.PublicIp
+
+  KeyPairName:
+    Description: Name of the created key pair.
+    Value: !Ref ApplicationKeyPair
+
+  SSMParameterName:
+    Description: SSM Parameter name holding the private key (retrieve with aws ssm get-parameter --name <value> --with-decryption).
+    Value: !Sub "/ec2/keypair/${ApplicationKeyPair.KeyPairId}"

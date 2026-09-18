@@ -1,0 +1,252 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Production-ready EC2 GPU instance running Ollama + LiteLLM for Claude Code CLI"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: OllamaQwQHost
+    Description: Project name used for naming resources.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: ID of the existing VPC to deploy the instance into.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of the existing public subnet to deploy the instance into.
+
+  InstanceType:
+    Type: String
+    Default: g5.2xlarge
+    AllowedValues: [g5.2xlarge, g5.4xlarge, g6e.2xlarge, g6e.4xlarge]
+    Description: EC2 instance type. g5.2xlarge (24GB A10G) is minimum for QwQ-32B; g6e provides 48GB L40S.
+
+  MarketType:
+    Type: String
+    Default: on-demand
+    AllowedValues: [on-demand, spot]
+    Description: Choose whether to run as a standard on-demand instance or a cost-saving spot instance.
+
+  OllamaModel:
+    Type: String
+    Default: qwq
+    Description: Base Ollama model to pull on deployment.
+
+  VolumeSize:
+    Type: Number
+    Default: 120
+    Description: Root volume size in GB (32B model + OS + cache requires ~40GB).
+
+  AMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/jammy/stable/current/amd64/hvm/ebs-gp2/ami-id
+    Description: Latest Ubuntu 22.04 LTS AMI ID from SSM.
+
+Conditions:
+  UseSpotInstance: !Equals [!Ref MarketType, "spot"]
+
+Resources:
+  # --- Key Pair ---
+  ApplicationKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub ${ProjectName}-generated-key
+      KeyType: rsa
+      KeyFormat: pem
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-key-pair
+
+  # --- IAM Role and Instance Profile ---
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-EC2InstanceRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # --- Security Group ---
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-sg
+      GroupDescription: Secure SSH access only. Ports 11434 and 4000 are accessible only via SSH tunnel.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH access for CLI management and port tunneling
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-sg
+
+  # --- Launch Template ---
+  EC2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref ApplicationKeyPair
+        ImageId: !Ref AMI
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        InstanceMarketOptions: !If
+          - UseSpotInstance
+          - MarketType: spot
+            SpotOptions:
+              SpotInstanceType: one-time
+          - !Ref "AWS::NoValue"
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: !Ref VolumeSize
+              VolumeType: gp3
+              Iops: 3000
+              Throughput: 500
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -eux
+
+            # 1. Update and install core toolchain
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -y
+            apt-get upgrade -y
+            apt-get install -y ubuntu-drivers-common curl jq software-properties-common python3-pip
+
+            # 2. Install NVIDIA drivers & CUDA libraries
+            ubuntu-drivers autoinstall
+
+            # 3. Install Ollama
+            curl -fsSL https://ollama.com/install.sh | sh
+
+            # 4. Configure Ollama systemd overrides for max efficiency & VRAM retention
+            mkdir -p /etc/systemd/system/ollama.service.d
+            cat <<EOF > /etc/systemd/system/ollama.service.d/override.conf
+            [Service]
+            Environment="OLLAMA_MAX_LOADED_MODELS=1"
+            Environment="OLLAMA_NUM_PARALLEL=1"
+            Environment="OLLAMA_KEEP_ALIVE=-1"
+            Environment="OLLAMA_CONTEXT_LENGTH=32768"
+            EOF
+
+            systemctl daemon-reload
+            systemctl enable --now ollama
+
+            # 5. Install LiteLLM Proxy
+            pip3 install litellm
+
+            mkdir -p /etc/litellm
+            cat <<EOF > /etc/litellm/config.yaml
+            model_list:
+              - model_name: qwq:32k
+                litellm_params:
+                  model: ollama/qwq:32k
+                  api_base: http://127.0.0.1:11434
+            EOF
+
+            # Create systemd service for LiteLLM
+            cat <<EOF > /etc/systemd/system/litellm.service
+            [Unit]
+            Description=LiteLLM Proxy Service for Claude CLI
+            After=network.target ollama.service
+            Wants=ollama.service
+
+            [Service]
+            Type=simple
+            User=root
+            ExecStart=/usr/local/bin/litellm --config /etc/litellm/config.yaml --port 4000
+            Restart=always
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            systemctl daemon-reload
+            systemctl enable --now litellm
+
+            # 6. Background task: Pull base model, build 32k context model, and prime VRAM
+            cat <<'EOF' > /tmp/setup_models.sh
+            #!/bin/bash
+            # Wait for GPU drivers to be active
+            until nvidia-smi > /dev/null 2>&1; do
+                sleep 5
+            done
+
+            # Pull target model
+            ollama pull ${OllamaModel}
+
+            # Create custom 32k context model tag
+            echo "FROM ${OllamaModel}" > /tmp/Modelfile
+            echo "PARAMETER num_ctx 32768" >> /tmp/Modelfile
+            ollama create qwq:32k -f /tmp/Modelfile
+
+            # Prime model into VRAM immediately
+            ollama run qwq:32k "Ready" > /dev/null 2>&1
+            EOF
+
+            chmod +x /tmp/setup_models.sh
+            nohup /tmp/setup_models.sh > /var/log/model_setup.log 2>&1 &
+
+  # --- EC2 Instance Resource ---
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref EC2LaunchTemplate
+        Version: !GetAtt EC2LaunchTemplate.LatestVersionNumber
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref InstanceSecurityGroup
+          SubnetId: !Ref SubnetId
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-instance
+
+Outputs:
+  InstancePublicIP:
+    Description: Public IP address of the EC2 instance.
+    Value: !GetAtt EC2Instance.PublicIp
+
+  SSMPrivateKeyCommand:
+    Description: Step 1 - Fetch SSH private key.
+    Value: !Sub "aws ssm get-parameter --name /ec2/keypair/${ApplicationKeyPair.KeyPairId} --with-decryption --query Parameter.Value --output text > private_key.pem && chmod 400 private_key.pem"
+
+  LiteLLMTunnelCommand:
+    Description: Step 2 - Open SSH Tunnel for Claude CLI (Port 4000).
+    Value: !Sub "ssh -i private_key.pem -N -L 4000:localhost:4000 ubuntu@${EC2Instance.PublicIp}"
+
+  ClaudeSettingsConfig:
+    Description: Step 3 - Add this content to your local settings-ollama.json file.
+    Value: '{"env": {"ANTHROPIC_BASE_URL": "http://localhost:4000", "ANTHROPIC_API_KEY": "sk-1234"}}'
+
+  ClaudeLaunchCommand:
+    Description: Step 4 - Launch Claude Code CLI connected directly to EC2.
+    Value: "claude --settings ./settings-ollama.json --model qwq:32k"

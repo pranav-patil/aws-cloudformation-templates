@@ -1,0 +1,902 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  Creates 3 VPCs (Private Spoke A, Public Spoke B with IGW, and Inspection VPC) connected via TGW
+  with AWS Network Firewall (ANFW) for centralized egress inspection.
+Parameters:
+  ProjectName:
+    Type: String
+    Default: EmproviseZyronCloudIPS
+  ScriptsBucket:
+    Type: String
+    Description: S3 bucket containing malware traffic generator scripts for traffic replay.
+  AvailabilityZoneSelection:
+    Description: Availability Zone
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1a
+  LatestAmiId:
+    Description: Latest EC2 Ubuntu 22.04 LTS (Jammy Jellyfish) from Systems Manager Parameter Store
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/jammy/stable/current/amd64/hvm/ebs-gp2/ami-id
+  InstanceType:
+    Description: WebServer EC2 instance type
+    Type: String
+    Default: t3.micro
+Resources:  
+  ApplicationKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: generated-key
+      KeyType: rsa
+      KeyFormat: pem
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub: ${ProjectName}-ec2-key-pair
+
+  #role for EC2 instances for systems manager
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-EC2InstanceRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      # The managed policy to allows the EC2 access to SSM permissions
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3ScriptBucketAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub "arn:aws:s3:::${ScriptsBucket}"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: 
+                  - !Sub "arn:aws:s3:::${ScriptsBucket}/*"
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # Inspection VPC Deployment for the AWS Network Firwall
+  InspectionVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: 100.64.0.0/16
+      Tags:
+        - Key: Name
+          Value: ANFW Inspection VPC
+
+  InspectionTransitGatewaySubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZoneSelection
+      CidrBlock: 100.64.0.0/28
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: Transit Gateway Subnet
+      VpcId: !Ref InspectionVPC
+
+  InspectionTransitGatewaySubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspectionVPC
+      Tags:
+        - Key: Name
+          Value: Inspection TGW Route Table
+
+  InspectionTransitGatewaySubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref InspectionTransitGatewaySubnet
+      RouteTableId: !Ref InspectionTransitGatewaySubnetRouteTable
+
+  InspectionFirewallSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZoneSelection
+      CidrBlock: 100.64.0.16/28
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: Firewall Subnet
+      VpcId: !Ref InspectionVPC
+
+  InspectionFirewallSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspectionVPC
+      Tags:
+        - Key: Name
+          Value: Inspection Firewall Route Table
+
+  InspectionFirewallSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref InspectionFirewallSubnet
+      RouteTableId: !Ref InspectionFirewallSubnetRouteTable
+
+  # Public Subnet for NAT Gateway in Inspection VPC
+  InspectionPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZoneSelection
+      CidrBlock: 100.64.0.32/28
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: Inspection Public Subnet (NAT Gateway)
+      VpcId: !Ref InspectionVPC
+
+  # Internet Gateway for Inspection VPC
+  InspectionInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Inspection VPC IGW
+
+  InspectionInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InspectionInternetGateway
+      VpcId: !Ref InspectionVPC
+
+  # Route Table for Public Subnet
+  InspectionPublicSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspectionVPC
+      Tags:
+        - Key: Name
+          Value: Inspection Public Route Table
+
+  InspectionPublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref InspectionPublicSubnet
+      RouteTableId: !Ref InspectionPublicSubnetRouteTable
+
+  # Route from Public Subnet to Internet via IGW
+  InspectionPublicToInternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InspectionInternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref InspectionPublicSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InspectionInternetGateway
+
+  # Route from Public Subnet back to Firewall for return traffic
+  InspectionPublicToFirewallRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref InspectionPublicSubnetRouteTable
+      DestinationCidrBlock: 10.0.0.0/8
+      # Route return traffic to the Firewall Endpoint (same as the TGW ingress route)
+      VpcEndpointId: !Select ["1", !Split [":", !Select ["0", !GetAtt InspectionFirewall.EndpointIds]]]      
+  
+  # Elastic IP for NAT Gateway in Inspection VPC
+  InspectionNATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InspectionInternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: Inspection NAT Gateway EIP
+
+  # NAT Gateway in Inspection VPC Public Subnet
+  InspectionNATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt InspectionNATGatewayEIP.AllocationId
+      SubnetId: !Ref InspectionPublicSubnet
+      Tags:
+        - Key: Name
+          Value: Inspection NAT Gateway
+
+  # Route from Firewall subnet to NAT Gateway for internet egress
+  InspectionFirewallToNATRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref InspectionFirewallSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref InspectionNATGateway
+
+  # Route from Firewall subnet back to TGW for private network traffic
+  InspectionFirewallToTGWPrivateRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InspectionVPCAttachment
+    Properties:
+      RouteTableId: !Ref InspectionFirewallSubnetRouteTable
+      DestinationCidrBlock: 10.0.0.0/8
+      TransitGatewayId: !Ref TransitGateway
+
+  # Spoke A VPC Deployment (Private VPC)
+  SpokeAVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: 10.1.0.0/16
+      Tags:
+        - Key: Name
+          Value: Spoke A Private VPC
+
+  SpokeATransitGatewaySubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZoneSelection
+      CidrBlock: 10.1.0.0/28
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: Transit Gateway Subnet
+      VpcId: !Ref SpokeAVPC
+
+  SpokeARouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SpokeAVPC
+      Tags:
+        - Key: Name
+          Value: Spoke A Route Table
+
+  SpokeATransitGatewaySubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SpokeATransitGatewaySubnet
+      RouteTableId: !Ref SpokeARouteTable
+
+  SpokeAWorkloadSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZoneSelection
+      CidrBlock: 10.1.1.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: Private Workload Subnet
+      VpcId: !Ref SpokeAVPC
+
+  SpokeAWorkloadSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SpokeAWorkloadSubnet
+      RouteTableId: !Ref SpokeARouteTable
+
+  # Route from Spoke A to TGW for all traffic
+  SpokeADefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: SpokeAVPCAttachment
+    Properties:
+      RouteTableId: !Ref SpokeARouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      TransitGatewayId: !Ref TransitGateway
+
+  SpokeAEC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-SpokeA-SecurityGroup"
+      GroupDescription: 'Allow all traffic from other Spoke VPCs to Spoke A Private Instance'
+      VpcId: !Ref SpokeAVPC
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          CidrIp: 10.0.0.0/8 # Allow from other Spoke VPCs
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  SpokeAInstance:
+    DependsOn: EC2InstanceRole
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref ApplicationKeyPair
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          AssociatePublicIpAddress: false
+          PrivateIpAddress: 10.1.1.4
+          SubnetId: !Ref SpokeAWorkloadSubnet
+          GroupSet:
+            - !Ref SpokeAEC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: Spoke A Private Instance
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+
+          echo "Waiting for internet connectivity..."
+          # Loop up to 30 times, waiting 10 seconds each time (5 minutes max)
+          for i in {1..30}; do
+              if curl -s -I http://us-east-1.ec2.archive.ubuntu.com > /dev/null; then
+                  echo "Internet connection established."
+                  break
+              else
+                  echo "Waiting for network... ($i/30)"
+                  sleep 10
+              fi
+          done
+
+          echo "Starting Instance A setup at $(date)"
+
+          apt-get update -y
+          apt-get install -y python3 python3-pip python3-venv awscli
+
+          MOCK_SERVER_DIR="/home/ubuntu/mock_server"
+          mkdir -p "$MOCK_SERVER_DIR"
+          cd "$MOCK_SERVER_DIR"
+
+          pip3 install fastapi uvicorn
+
+          cat <<EOF > main.py
+          from fastapi import FastAPI, Request
+          from datetime import datetime
+
+          app = FastAPI()
+
+          @app.api_route("/{path_name:path}", methods=["GET", "POST", "PUT", "DELETE"])
+          async def catch_all(request: Request, path_name: str):
+              return {
+                  "status": "success",
+                  "message": "Mock response for Suricata testing",
+                  "path": f"/{path_name}",
+                  "method": request.method,
+                  "timestamp": datetime.now().isoformat()
+              }
+          EOF
+
+          chown -R ubuntu:ubuntu "$MOCK_SERVER_DIR"
+
+          echo "Step 3: Creating systemd service..."
+          cat <<EOF > /etc/systemd/system/mock-http-server.service
+          [Unit]
+          Description=FastAPI Mock Server
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=$MOCK_SERVER_DIR
+          Environment="MOCK_PORT=80"
+          Environment="MOCK_LOG_FILE=/var/log/mock-server.log"
+          ExecStart=/usr/local/bin/uvicorn main:app --host 0.0.0.0 --port 80
+          Restart=always
+          RestartSec=10
+          StandardOutput=append:/var/log/mock-server.log
+          StandardError=append:/var/log/mock-server.log
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable mock-http-server.service
+          systemctl start mock-http-server.service
+
+          sleep 10
+          systemctl is-active --quiet mock-http-server.service && echo "SUCCESS" || exit 1
+
+  # Spoke B VPC Deployment (Public VPC with Internet Gateway)
+  SpokeBVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: 10.2.0.0/16
+      Tags:
+        - Key: Name
+          Value: Spoke B Public VPC
+
+  SpokeBTransitGatewaySubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZoneSelection
+      CidrBlock: 10.2.0.0/28
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: Transit Gateway Subnet
+      VpcId: !Ref SpokeBVPC
+
+  SpokeBTGWRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SpokeBVPC
+      Tags:
+        - Key: Name
+          Value: Spoke B TGW Route Table
+
+  # Route from Spoke B TGW subnet to Private VPC via TGW (for return traffic after inspection)
+  SpokeBTGWToPrivateVPCRoute:
+    Type: AWS::EC2::Route
+    DependsOn: SpokeBVPCAttachment
+    Properties:
+      RouteTableId: !Ref SpokeBTGWRouteTable
+      DestinationCidrBlock: 10.1.0.0/16
+      TransitGatewayId: !Ref TransitGateway
+
+  SpokeBWorkloadRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SpokeBVPC
+      Tags:
+        - Key: Name
+          Value: Spoke B Workload Route Table
+
+  SpokeBTransitGatewaySubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SpokeBTransitGatewaySubnet
+      RouteTableId: !Ref SpokeBTGWRouteTable
+
+  SpokeBWorkloadSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZoneSelection
+      CidrBlock: 10.2.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Public Workload Subnet
+      VpcId: !Ref SpokeBVPC
+
+  SpokeBWorkloadSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SpokeBWorkloadSubnet
+      RouteTableId: !Ref SpokeBWorkloadRouteTable
+
+  # Internet Gateway for Spoke B Public VPC
+  SpokeBInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Spoke B IGW
+
+  SpokeBInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref SpokeBInternetGateway
+      VpcId: !Ref SpokeBVPC
+
+  # Route from Spoke B Workload to Internet via IGW
+  SpokeBWorkloadDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: SpokeBInternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref SpokeBWorkloadRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref SpokeBInternetGateway
+
+  # Route from Spoke B Workload to Private VPC via TGW (for internal traffic)
+  SpokeBWorkloadToPrivateRoute:
+    Type: AWS::EC2::Route
+    DependsOn: SpokeBVPCAttachment
+    Properties:
+      RouteTableId: !Ref SpokeBWorkloadRouteTable
+      DestinationCidrBlock: 10.1.0.0/16
+      TransitGatewayId: !Ref TransitGateway
+
+  SpokeBEC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-SpokeB-SecurityGroup"
+      GroupDescription: 'Allow HTTP and SSH access to Spoke B Public Instance'
+      VpcId: !Ref SpokeBVPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 8080
+        ToPort: 8080
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: icmp
+        FromPort: -1
+        ToPort: -1
+        CidrIp: 10.0.0.0/8 # Allow pings from other Spoke VPCs
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  SpokeBInstance:
+    DependsOn: EC2InstanceRole
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref ApplicationKeyPair
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          AssociatePublicIpAddress: true # Instance in public subnet needs public IP
+          PrivateIpAddress: 10.2.1.4
+          SubnetId: !Ref SpokeBWorkloadSubnet
+          GroupSet:
+            - !Ref SpokeBEC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: Spoke B Public Instance
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -o pipefail
+
+          # Setup logging: redirect all output to both console and log file
+          LOG_FILE="/var/log/traffic-generator.log"
+          exec > >(tee -a $LOG_FILE) 2>&1
+
+          echo "--- Starting Instance B setup: $(date) ---"
+
+          # 1. Install Dependencies
+          apt-get update -y
+          apt-get install -y python3-pip python3-requests curl dnsutils
+
+          TARGET_IP="${EC2InstanceA.PrivateIp}"
+          echo "Executing scripts against Target: $TARGET_IP"
+
+          echo "Waiting for private EC2 instance (http://$TARGET_IP) to be ready..."
+          MAX_RETRIES=300
+          COUNT=0
+          while [ $COUNT -lt $MAX_RETRIES ]; do
+              HTTP_STATUS=$(curl -s -L -o /dev/null -w '%{http_code}' http://$TARGET_IP/ 2>/dev/null || echo "000")
+              
+              if [ "$HTTP_STATUS" = "200" ]; then
+                  echo "Private EC2 instance is ready!"
+                  break
+              fi
+              
+              COUNT=$((COUNT + 1))
+              echo "Attempt $COUNT/$MAX_RETRIES: Retrying connection to Private EC2 Instance in 10s..."
+              sleep 10
+          done
+
+          if [ $COUNT -eq $MAX_RETRIES ]; then
+              echo "Error: Private EC2 Instance failed to become ready in time."
+              exit 1
+          fi
+
+          # 3. Create Python Threat Simulation Script
+          cat << 'EOF' > /home/ubuntu/generate_threat_traffic.py
+          import sys
+          import time
+          import socket
+          import requests
+
+          target_ip = sys.argv[1]
+          target_url = f"http://{target_ip}"
+
+          # EICAR standard anti-virus/malware test string
+          EICAR_STRING = r'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*'
+
+          # Known signatures targeted by ThreatSignatures Managed Rulegroups
+          KNOWN_BAD_USER_AGENTS = [
+              "Nikto",
+              "sqlmap/1.0",
+              "Wget/1.9+cvs-stable",
+              "Zeus",
+              "BlackSun",
+              "Mozilla/5.0 (Windows NT 6.1; Win64; x64) CobaltStrike"
+          ]
+
+          SUSPICIOUS_PATHS = [
+              "/cmd.exe",
+              "/etc/passwd",
+              "/.env",
+              "/shell?cmd=cat%20/etc/passwd",
+              "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php"
+          ]
+
+          DNS_TEST_DOMAINS = [
+              "eicar.org",
+              "testmyids.com"
+          ]
+
+          def trigger_eicar_payload():
+              print("[+] Sending EICAR malware payload via POST request...")
+              try:
+                  res = requests.post(target_url, data={"file": EICAR_STRING}, timeout=5)
+                  print(f"    EICAR POST status: {res.status_code}")
+              except Exception as e:
+                  print(f"    EICAR request triggered block/error: {e}")
+
+          def trigger_malicious_user_agents():
+              print("[+] Injecting known threat User-Agent signatures...")
+              for ua in KNOWN_BAD_USER_AGENTS:
+                  try:
+                      headers = {"User-Agent": ua}
+                      res = requests.get(target_url, headers=headers, timeout=5)
+                      print(f"    User-Agent '{ua}' status: {res.status_code}")
+                  except Exception as e:
+                      print(f"    User-Agent '{ua}' triggered block/error: {e}")
+
+          def trigger_exploit_paths():
+              print("[+] Testing exploit paths targeted by ThreatSignatures rules...")
+              for path in SUSPICIOUS_PATHS:
+                  try:
+                      res = requests.get(f"{target_url}{path}", timeout=5)
+                      print(f"    Path '{path}' status: {res.status_code}")
+                  except Exception as e:
+                      print(f"    Path '{path}' triggered block/error: {e}")
+
+          def trigger_dns_queries():
+              print("[+] Triggering malicious DNS lookups...")
+              for domain in DNS_TEST_DOMAINS:
+                  try:
+                      socket.gethostbyname(domain)
+                      print(f"    DNS Lookup for {domain} succeeded.")
+                  except Exception as e:
+                      print(f"    DNS Lookup for {domain} failed: {e}")
+
+          if __name__ == "__main__":
+              print(f"--- Starting Threat Traffic Simulation against {target_ip} ---")
+              # Run 3 iterative cycles to ensure rules fire consistently in firewall logs
+              for cycle in range(1, 4):
+                  print(f"\n--- Simulation Cycle {cycle} ---")
+                  trigger_eicar_payload()
+                  trigger_malicious_user_agents()
+                  trigger_exploit_paths()
+                  trigger_dns_queries()
+                  time.sleep(2)
+              print("\n--- Simulation Complete ---")
+          EOF
+
+          # 4. Execute the Script
+          chown ubuntu:ubuntu /home/ubuntu/generate_threat_traffic.py
+          python3 /home/ubuntu/generate_threat_traffic.py "$TARGET_IP"
+
+          echo "--- Setup Complete: $(date) ---"
+
+
+  # Transit Gateway and Transit Gateway attachment configuration
+  TransitGateway:
+    Type: AWS::EC2::TransitGateway
+    Properties:
+      AmazonSideAsn: 64512
+      Description: ANFW Tranist Gateway
+      AutoAcceptSharedAttachments: disable
+      DefaultRouteTableAssociation: disable
+      DefaultRouteTablePropagation: disable
+      DnsSupport: enable
+      VpnEcmpSupport: enable
+      MulticastSupport: disable
+
+  InspectionVPCAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties:
+      SubnetIds:
+        - !Ref InspectionTransitGatewaySubnet
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref InspectionVPC
+      Tags:
+        - Key: Name
+          Value: Inspection VPC TGW Attachment
+
+  SpokeAVPCAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties:
+      SubnetIds:
+        - !Ref SpokeATransitGatewaySubnet
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref SpokeAVPC
+      Tags:
+        - Key: Name
+          Value: Spoke A VPC TGW Attachment
+
+  SpokeBVPCAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties:
+      SubnetIds:
+        - !Ref SpokeBTransitGatewaySubnet
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref SpokeBVPC
+      Tags:
+        - Key: Name
+          Value: Spoke B VPC TGW Attachment
+
+  # TGW Route Table for Spoke A (Private VPC) - routes to Inspection VPC
+  SpokeARouteTableTGW:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      Tags:
+        - Key: Name
+          Value: Spoke A Private Route Table
+
+  # TGW Route Table for Inspection VPC - routes to Spoke B (Public VPC)
+  InspectionRouteTableTGW:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      Tags:
+        - Key: Name
+          Value: Inspection Route Table
+
+  # TGW Route Table for Spoke B (Public VPC) - routes back to Inspection
+  SpokeBRouteTableTGW:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      Tags:
+        - Key: Name
+          Value: Spoke B Public Route Table
+
+  # Associate Spoke A with its route table
+  SpokeATGWRouteTableAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SpokeAVPCAttachment
+      TransitGatewayRouteTableId: !Ref SpokeARouteTableTGW
+
+  # Associate Inspection VPC with its route table
+  InspectionTGWRouteTableAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref InspectionVPCAttachment
+      TransitGatewayRouteTableId: !Ref InspectionRouteTableTGW
+
+  # Associate Spoke B with its route table
+  SpokeBTGWRouteTableAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SpokeBVPCAttachment
+      TransitGatewayRouteTableId: !Ref SpokeBRouteTableTGW
+
+  # Route from Spoke A TGW RT to Inspection VPC (all traffic)
+  SpokeAToInspectionRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    Properties:
+      TransitGatewayRouteTableId: !Ref SpokeARouteTableTGW
+      DestinationCidrBlock: 0.0.0.0/0
+      TransitGatewayAttachmentId: !Ref InspectionVPCAttachment
+
+  # Route from Inspection TGW RT to Spoke B (all traffic)
+  InspectionToSpokeBRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    Properties:
+      TransitGatewayRouteTableId: !Ref InspectionRouteTableTGW
+      DestinationCidrBlock: 0.0.0.0/0
+      TransitGatewayAttachmentId: !Ref SpokeBVPCAttachment
+
+  # Route from Inspection TGW RT to Spoke A (for inspected traffic destined to Spoke A)
+  InspectionToSpokeARoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    Properties:
+      TransitGatewayRouteTableId: !Ref InspectionRouteTableTGW
+      DestinationCidrBlock: 10.1.0.0/16 # Spoke A CIDR Block
+      TransitGatewayAttachmentId: !Ref SpokeAVPCAttachment
+  
+  # Route from Spoke B TGW RT back to Inspection VPC (for return traffic from Spoke A)
+  SpokeBToInspectionRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    Properties:
+      TransitGatewayRouteTableId: !Ref SpokeBRouteTableTGW
+      DestinationCidrBlock: 10.1.0.0/16
+      TransitGatewayAttachmentId: !Ref InspectionVPCAttachment
+
+  InspectionFirewallPolicy:
+    Type: AWS::NetworkFirewall::FirewallPolicy
+    Properties:
+      FirewallPolicyName: 
+        Fn::Sub: inspection-firewall-policy-${ProjectName}
+      Description: Network firewall policy to control internet egress and ingress traffic for Spoke A and Spoke B
+      FirewallPolicy:
+        StatefulEngineOptions: 
+          RuleOrder: STRICT_ORDER
+          StreamExceptionPolicy: REJECT
+        StatefulRuleGroupReferences:
+          - ResourceArn: !Sub arn:aws:network-firewall:${AWS::Region}:aws-managed:stateful-rulegroup/ThreatSignaturesBotnetActionOrder
+            Priority: 1
+        StatelessDefaultActions:
+          - aws:forward_to_sfe
+        StatelessFragmentDefaultActions:
+          - aws:forward_to_sfe
+      Tags:
+        - Key: Name
+          Value: Inspection Firewall Policy
+
+  InspectionFirewall:
+    Type: AWS::NetworkFirewall::Firewall
+    Properties:
+      FirewallName: ANFW-Lab-Firewall
+      FirewallPolicyArn: !Ref InspectionFirewallPolicy
+      VpcId: !Ref InspectionVPC
+      SubnetMappings:
+        - SubnetId: !Ref InspectionFirewallSubnet
+      Description: Egress Firewall
+
+  # Route from TGW Subnet to Network Firewall ENI for inspection
+  # MUST be created AFTER the firewall to ensure endpoints are available
+  InspectionTGWToFirewallRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref InspectionTransitGatewaySubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0 # Route all traffic coming from TGW to the firewall endpoint
+      # Extract the VPC Endpoint ID from EndpointIds (format: "us-east-1a:vpce-xxxxx")
+      VpcEndpointId: !Select ["1", !Split [":", !Select ["0", !GetAtt InspectionFirewall.EndpointIds]]]
+
+  InspectionFirewallLogFlowGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: inspection-fw/flow
+
+  InspectionFirewallLogAlertGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: inspection-fw/alert
+
+  InspectionFirewallLog:
+    Type: AWS::NetworkFirewall::LoggingConfiguration
+    Properties:
+      FirewallArn: !Ref InspectionFirewall
+      LoggingConfiguration:
+        LogDestinationConfigs:
+          - LogType: FLOW
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: inspection-fw/flow
+          - LogType: ALERT
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: inspection-fw/alert
+
+Outputs:
+  SpokeAInstanceId:
+    Description: "Instance ID of Spoke A Private EC2 instance"
+    Value: !Ref SpokeAInstance
+  SpokeAInstancePrivateIp:
+    Description: Private IP address of Spoke A instance (no public IP)
+    Value: !GetAtt SpokeAInstance.PrivateIp
+  SpokeBInstanceId:
+    Description: "Instance ID of Spoke B Public EC2 instance"
+    Value: !Ref SpokeBInstance
+  SpokeBInstancePublicIp:
+    Description: Public IP address of Spoke B instance
+    Value: !GetAtt SpokeBInstance.PublicIp
+  SpokeBInstancePrivateIp:
+    Description: Private IP address of Spoke B instance
+    Value: !GetAtt SpokeBInstance.PrivateIp
+  TransitGatewayId:
+    Description: Transit Gateway ID
+    Value: !Ref TransitGateway
+  InspectionFirewallEndpoint:
+    Description: Network Firewall VPC Endpoint ID
+    Value: !Select ["1", !Split [":", !Select ["0", !GetAtt InspectionFirewall.EndpointIds]]]
+  KeyName:
+    Description: Name of the created key pair
+    Value: !Ref ApplicationKeyPair
+  SSMParameterName:
+    Description: Name of the SSM Parameter holding the private key
+    Value: !Sub "/ec2/keypair/${ApplicationKeyPair.KeyPairId}"
+  InspectionNATGatewayEIP:
+    Description: Inspection VPC NAT Gateway Elastic IP for Spoke A outbound traffic
+    Value: !Ref InspectionNATGatewayEIP

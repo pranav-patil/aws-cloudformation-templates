@@ -1,0 +1,919 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS Network Firewall - Single VPC Transit Model with Cross-Subnet Inspection and Traffic Generator"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: EmproviseZyronCloudIPSDemo
+  VPCCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC.
+  ProtectedSubnetACIDR:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR for the Protected Subnet (where instance A resides).
+  PublicSubnetBCIDR:
+    Type: String
+    Default: 10.0.3.0/24
+    Description: CIDR for the Public/Unprotected Subnet (where instance B resides).
+  FirewallSubnetACIDR:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR for the Network Firewall Endpoint Subnet.
+  InstanceType:
+    Type: String
+    Default: t3.large
+    Description: EC2 instance type for desktop instance (requires more resources for GUI).
+  BastionInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for bastion host.
+  AMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/jammy/stable/current/amd64/hvm/ebs-gp2/ami-id
+    Description: Latest Ubuntu 22.04 LTS (Jammy Jellyfish) from Systems Manager Parameter Store
+  SSMCertParameterName:
+    Type: String
+    Default: 'tls-inspection-ca-cert'
+    Description: 'SSM Parameter name to store the Root CA PEM'
+  CategoryAction:
+    Type: String
+    Default: 'alert'
+    Description: 'Action to take for AI/ML category traffic'
+    AllowedValues:
+      - alert
+      - pass
+      - reject
+
+Mappings:
+  KlayersCryptoMap:
+    us-east-1:
+      Arn: 'arn:aws:lambda:us-east-1:${AWS::AccountId}:layer:Klayers-p311-cryptography:23'
+    us-east-2:
+      Arn: 'arn:aws:lambda:us-east-2:${AWS::AccountId}:layer:Klayers-p311-cryptography:23'
+    us-west-1:
+      Arn: 'arn:aws:lambda:us-west-1:${AWS::AccountId}:layer:Klayers-p311-cryptography:23'
+    us-west-2:
+      Arn: 'arn:aws:lambda:us-west-2:${AWS::AccountId}:layer:Klayers-p311-cryptography:23'
+    eu-central-1:
+      Arn: 'arn:aws:lambda:eu-central-1:${AWS::AccountId}:layer:Klayers-p311-cryptography:23'
+    eu-west-1:
+      Arn: 'arn:aws:lambda:eu-west-1:${AWS::AccountId}:layer:Klayers-p311-cryptography:23'
+    ap-south-1:
+      Arn: 'arn:aws:lambda:ap-south-1:${AWS::AccountId}:layer:Klayers-p311-cryptography:23'
+    ap-southeast-1:
+      Arn: 'arn:aws:lambda:ap-southeast-1:${AWS::AccountId}:layer:Klayers-p311-cryptography:23'
+    ap-southeast-2:
+      Arn: 'arn:aws:lambda:ap-southeast-2:${AWS::AccountId}:layer:Klayers-p311-cryptography:23'
+    ap-northeast-1:
+      Arn: 'arn:aws:lambda:ap-northeast-1:${AWS::AccountId}:layer:Klayers-p311-cryptography:23'
+    ca-central-1:
+      Arn: 'arn:aws:lambda:ca-central-1:${AWS::AccountId}:layer:Klayers-p311-cryptography:23'
+    sa-east-1:
+      Arn: 'arn:aws:lambda:sa-east-1:${AWS::AccountId}:layer:Klayers-p311-cryptography:23'
+
+Resources:
+
+  # --- 1. VPC and Networking Resources ---
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-nfw-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # --- 2. Subnets ---
+  ProtectedSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref ProtectedSubnetACIDR
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-private-protected-subnet-a
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetBCIDR
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-public-unprotected-subnet-b
+
+  FirewallSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref FirewallSubnetACIDR
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub: ${ProjectName}-firewall-subnet-a
+
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-nat-eip
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-nat-gateway
+
+  # --- 3. Certificate Generation ---
+
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [lambda.amazonaws.com] }
+            Action: ['sts:AssumeRole']
+      Policies:
+        - PolicyName: CertGenPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action: ['ssm:PutParameter', 'ssm:DeleteParameter']
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${SSMCertParameterName}'
+              - Effect: Allow
+                Action: ['acm:ImportCertificate', 'acm:AddTagsToCertificate', 'acm:DeleteCertificate']
+                Resource: '*'
+
+  CertificateGeneratorFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-cert-generator'
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 60
+      Layers: 
+        - !FindInMap [KlayersCryptoMap, !Ref 'AWS::Region', Arn]
+      Code:
+        ZipFile: |
+          import json, boto3, datetime, urllib.request, traceback
+          from cryptography import x509
+          from cryptography.x509.oid import NameOID
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import rsa
+
+          def build_subject(cn):
+              return x509.Name([
+                  x509.NameAttribute(NameOID.COUNTRY_NAME, u"US"),
+                  x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, u"VA"),
+                  x509.NameAttribute(NameOID.LOCALITY_NAME, u"IAD28"),
+                  x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"Custom Org"),
+                  x509.NameAttribute(NameOID.COMMON_NAME, cn)
+              ])
+
+          def gen_ca(cn, days, is_root=False, signing_cert=None, signing_key=None):
+              key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+              subj = build_subject(cn)
+              builder = x509.CertificateBuilder()
+              builder = builder.subject_name(subj)
+              builder = builder.issuer_name(subj if is_root else signing_cert.subject)
+              builder = builder.public_key(key.public_key())
+              builder = builder.serial_number(x509.random_serial_number())
+              builder = builder.not_valid_before(datetime.datetime.utcnow())
+              builder = builder.not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=days))
+              builder = builder.add_extension(x509.BasicConstraints(ca=True, path_length=None if is_root else 1), critical=True)
+              builder = builder.add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False, key_encipherment=False, data_encipherment=False, key_agreement=False, key_cert_sign=True, crl_sign=True, encipher_only=False, decipher_only=False), critical=True)
+              builder = builder.add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+              if not is_root:
+                  builder = builder.add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(signing_cert.public_key()), critical=False)
+              cert = builder.sign(private_key=key if is_root else signing_key, algorithm=hashes.SHA256())
+              return key, cert
+
+          def handler(event, context):
+              ssm = boto3.client('ssm')
+              acm = boto3.client('acm')
+              param_name = event['ResourceProperties']['ParameterName']
+              # Retrieve PhysicalResourceId from event (passed by CFN on Delete/Update)
+              physical_id = event.get('PhysicalResourceId')
+
+              if event['RequestType'] == 'Delete':
+                  try:
+                      # 1. Delete SSM Parameter
+                      ssm.delete_parameter(Name=param_name)
+                      # 2. Delete ACM Certificate (The physical_id IS the ARN)
+                      if physical_id and physical_id.startswith('arn:aws:acm'):
+                          acm.delete_certificate(CertificateArn=physical_id)
+                  except Exception as e:
+                      print(f"Cleanup error (ignored to prevent stuck stack): {e}")
+                  
+                  send_response(event, "SUCCESS", physical_id)
+                  return
+
+              try:
+                  root_k, root_c = gen_ca("Custom Root CA", 7300, is_root=True)
+                  int_k, int_c = gen_ca("Custom Intermediate CA", 3650, is_root=False, signing_cert=root_c, signing_key=root_k)
+                  root_pem_bytes = root_c.public_bytes(serialization.Encoding.PEM)
+                  int_pem = int_c.public_bytes(serialization.Encoding.PEM)
+                  int_key_pem = int_k.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption())
+
+                  ssm.put_parameter(Name=param_name, Value=root_pem_bytes.decode('utf-8'), Type='String', Overwrite=True, Description='Root CA for TLS Inspection')
+                  
+                  # Import to ACM
+                  acm_resp = acm.import_certificate(Certificate=int_pem, PrivateKey=int_key_pem, CertificateChain=root_pem_bytes)
+                  cert_arn = acm_resp['CertificateArn']
+                  
+                  # SUCCESS: Return cert_arn as the PhysicalResourceId
+                  send_response(event, "SUCCESS", cert_arn, {"CertificateArn": cert_arn})
+              except Exception as e:
+                  traceback.print_exc()
+                  send_response(event, "FAILED", physical_id or "ErrorID", {"Error": str(e)})
+
+          def send_response(event, status, physical_id, data=None):
+              body = json.dumps({
+                  "Status": status,
+                  "PhysicalResourceId": physical_id,
+                  "StackId": event['StackId'],
+                  "RequestId": event['RequestId'],
+                  "LogicalResourceId": event['LogicalResourceId'],
+                  "Data": data or {}
+              }).encode('utf-8')
+              urllib.request.urlopen(urllib.request.Request(event['ResponseURL'], data=body, method='PUT'))
+
+  # Custom Resource Trigger
+  CertificateTrigger:
+    Type: 'Custom::CertificateTrigger'
+    Properties:
+      ServiceToken: !GetAtt CertificateGeneratorFunction.Arn
+      ParameterName: !Ref SSMCertParameterName
+  
+  # --- 4. Network Firewall and Endpoint ---
+
+  FirewallTLSConfiguration:
+    Type: AWS::NetworkFirewall::TLSInspectionConfiguration
+    Properties:
+      TLSInspectionConfigurationName: !Sub ${ProjectName}-tls-inspection-configuration
+      TLSInspectionConfiguration:
+        ServerCertificateConfigurations:
+          # Define configurations for inbound or outbound inspection
+          # Example for outbound inspection (using a CA certificate ARN)
+          - CertificateAuthorityArn: !GetAtt CertificateTrigger.CertificateArn
+            CheckCertificateRevocationStatus:
+              RevokedStatusAction: DROP
+              UnknownStatusAction: PASS
+            Scopes:
+              # Define the source and destination IP addresses/ranges and ports to decrypt
+              - Sources:
+                  - AddressDefinition: 0.0.0.0/0
+                Destinations:
+                  - AddressDefinition: 0.0.0.0/0
+                SourcePorts:
+                  - FromPort: 0
+                    ToPort: 65535
+                DestinationPorts:
+                  - FromPort: 443
+                    ToPort: 443
+                Protocols: 
+                  - 6 # TCP protocol
+      Description: "TLS Inspection Configuration for outbound traffic"
+      Tags:
+        - Key: "Purpose"
+          Value: "TLSInspection"
+
+  FirewallPolicy:
+    Type: AWS::NetworkFirewall::FirewallPolicy
+    Properties:
+      FirewallPolicyName:
+        Fn::Sub: ${ProjectName}-firewall-policy
+      Description: Network firewall policy to control internet egress and ingress
+      FirewallPolicy:
+        TLSInspectionConfigurationArn: !Ref FirewallTLSConfiguration
+        StatefulEngineOptions: 
+          RuleOrder: STRICT_ORDER
+          StreamExceptionPolicy: REJECT
+        StatefulRuleGroupReferences:
+          - ResourceArn: !GetAtt FirewallStatefulAICategoryBlock.RuleGroupArn
+            Priority: 1  # Lower priority (evaluated after allow rules)
+        StatelessDefaultActions:
+          - aws:forward_to_sfe
+        StatelessFragmentDefaultActions:
+          - aws:forward_to_sfe
+        PolicyVariables:
+          RuleVariables:
+            HOME_NET:
+              Definition:
+                - 10.0.0.0/8
+                - 172.16.0.0/12
+                - 192.168.0.0/16
+
+  TempFirewallPolicy:
+    Type: AWS::NetworkFirewall::FirewallPolicy
+    Properties:
+      Description: Temp Network firewall policy to control Network Firewall until TLS Inspection is fully configured
+      FirewallPolicyName:
+        Fn::Sub: ${ProjectName}-temp-firewall-policy
+      FirewallPolicy:
+        StatefulEngineOptions:
+          RuleOrder: STRICT_ORDER
+        StatelessDefaultActions:
+        - aws:forward_to_sfe
+        StatelessFragmentDefaultActions:
+        - aws:pass
+        StatefulRuleGroupReferences:
+          - ResourceArn: !GetAtt FirewallStatefulDefaultAllow.RuleGroupArn
+            Priority: 1
+
+  FirewallStatefulDefaultAllow:
+    Type: AWS::NetworkFirewall::RuleGroup
+    Properties:
+      RuleGroupName: !Sub ${ProjectName}-default-allow-rules
+      Capacity: 50
+      Type: STATEFUL
+      RuleGroup:
+        StatefulRuleOptions:
+          RuleOrder: STRICT_ORDER
+        RulesSource:
+          RulesString: |
+            # Allow all SSH traffic by default
+            pass tcp any any -> any 22 (msg:"Allow SSH"; sid:2004; rev:1;)
+            # Allow all HTTPS traffic by default
+            pass tls any any -> any 443 (msg:"Allow HTTPS"; sid:2000; rev:1;)
+            # Allow inner decrypted HTTP payload on port 443
+            pass http any any -> any 443 (msg:"Allow Decrypted HTTP over 443"; sid:2005; rev:1;)
+            # Allow all HTTP traffic
+            pass tcp any any -> any 80 (msg:"Allow HTTP"; sid:2001; rev:1;)
+            # Allow DNS
+            pass udp any any -> any 53 (msg:"Allow DNS"; sid:2002; rev:1;)
+            pass tcp any any -> any 53 (msg:"Allow DNS TCP"; sid:2003; rev:1;)
+
+  FirewallStatefulAICategoryBlock:
+      Type: AWS::NetworkFirewall::RuleGroup
+      Properties:
+        RuleGroupName: !Sub ${ProjectName}-ai-category-rules
+        Capacity: 100
+        Type: STATEFUL
+        RuleGroup:
+          StatefulRuleOptions:
+            RuleOrder: STRICT_ORDER
+          RulesSource:
+            RulesString: !Sub |
+              # Block known AI/ML domains
+              ${CategoryAction} http any any -> any 443 (msg:"Block OpenAI"; flow:to_server,established; http.host; content:"openai.com"; sid:1001; rev:4;)
+              ${CategoryAction} http any any -> any 443 (msg:"Block ChatGPT"; flow:to_server,established; http.host; content:"chat.openai.com"; sid:1002; rev:4;)
+              ${CategoryAction} http any any -> any 443 (msg:"Block Claude"; flow:to_server,established; http.host; content:"claude.ai"; sid:1003; rev:4;)
+              ${CategoryAction} http any any -> any 443 (msg:"Block Anthropic"; flow:to_server,established; http.host; content:"anthropic.com"; sid:1004; rev:4;)
+              ${CategoryAction} http any any -> any 443 (msg:"Block Gemini"; flow:to_server,established; http.host; content:"gemini.google.com"; sid:1005; rev:4;)
+              ${CategoryAction} http any any -> any 443 (msg:"Block Bard"; flow:to_server,established; http.host; content:"bard.google.com"; sid:1006; rev:4;)
+              ${CategoryAction} http any any -> any 443 (msg:"Block Copilot"; flow:to_server,established; http.host; content:"copilot.microsoft.com"; sid:1007; rev:4;)
+              ${CategoryAction} http any any -> any 443 (msg:"Block Hugging Face"; flow:to_server,established; http.host; content:"huggingface.co"; sid:1008; rev:4;)
+
+              # Advanced inspection for Claude MCP
+              ${CategoryAction} http any any -> any 443 (msg:"Block Claude MCP URI"; flow:to_server,established; http.uri; content:"/mcp"; sid:1010; rev:4;)
+
+              # Block HTTP versions
+              ${CategoryAction} http any any -> any 80 (msg:"Block OpenAI HTTP"; flow:to_server,established; http.host; content:"openai.com"; sid:1101; rev:3;)
+              ${CategoryAction} http any any -> any 80 (msg:"Block Claude HTTP"; flow:to_server,established; http.host; content:"claude.ai"; sid:1102; rev:3;)
+
+              # Alert on suspicious AI-related traffic patterns
+              ${CategoryAction} http any any -> any 443 (msg:"AI API endpoint detected"; flow:to_server,established; http.host; content:"api."; pcre:"/api\.(openai|anthropic|cohere|ai21)/i"; sid:2001; rev:3;)
+
+              # AI Models and MCP (Model Control Protocol) related patterns
+              ${CategoryAction} http any any -> any any (msg:"Block MCP server request"; flow:to_server,established; http.method; content:"POST"; http.uri; content:"/mcp"; http.request_body; content:"jsonrpc"; content:"tools/list"; sid:1000001; rev:3;)
+              ${CategoryAction} http any any -> any any (msg:"Block access to AI models"; flow:to_server,established; http.uri; pcre:"/\/v[0-9*]\/models/i"; sid:1000002; rev:3;)
+              ${CategoryAction} http $HOME_NET any -> $EXTERNAL_NET any (msg:"POTENTIAL Shadow AI: OpenAPI-style JSON POST"; flow:to_server,established; http.method; content:"POST"; http.header_names; content:"content-type"; http.header; content:"application/json"; http.uri; content:"/v1/"; sid:910001; rev:3;)
+              ${CategoryAction} http $HOME_NET any -> $EXTERNAL_NET 443 (msg:"Shadow AI: High-frequency LLM API usage"; flow:to_server,established; http.host; content:"api.openai.com"; threshold:type both, track by_src, count 100, seconds 60; sid:910030; rev:3;)
+
+              pass tcp 10.0.0.0/8 any -> 10.0.0.0/8 any (msg:"Allow internal traffic"; sid:3001; rev:2;)
+              pass tcp 172.16.0.0/12 any -> 172.16.0.0/12 any (msg:"Allow internal traffic"; sid:3002; rev:2;)
+              pass tcp 192.168.0.0/16 any -> 192.168.0.0/16 any (msg:"Allow internal traffic"; sid:3003; rev:2;)
+
+              pass icmp any any -> any any (msg:"Allow ICMP"; sid:3006; rev:2;)
+
+              # Allow DNS
+              pass udp any any -> any 53 (msg:"Allow DNS queries"; sid:3004; rev:2;)
+              pass tcp any any -> any 53 (msg:"Allow DNS over TCP"; sid:3005; rev:2;)
+
+              # STRICT ORDER FALLBACKS (CRITICAL FIX)
+              pass http any any -> any 443 (msg:"Allow benign decrypted HTTP"; flow:to_server,established; sid:9999; rev:3;)
+        Tags:
+          - Key: Name
+            Value: 'AI-filter-rule'
+          - Key: Category
+            Value: 'AI-ML-Filtering'
+
+  NetworkFirewall:
+    Type: AWS::NetworkFirewall::Firewall
+    DependsOn:
+      - FirewallTLSConfiguration
+      - FirewallStatefulAICategoryBlock
+    Properties:
+      FirewallName: !Sub ${ProjectName}-firewall
+      VpcId: !Ref VPC
+      FirewallPolicyArn: !Ref TempFirewallPolicy
+      DeleteProtection: false
+      FirewallPolicyChangeProtection: false
+      SubnetChangeProtection: false
+      SubnetMappings:
+        - SubnetId: !Ref FirewallSubnetA
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-firewall
+
+  FirewallLogFlowGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/network-firewall/egress-inspection/${AWS::Region}/${ProjectName}-flow
+
+  FirewallLogAlertGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/network-firewall/egress-inspection/${AWS::Region}/${ProjectName}-alert
+
+  FirewallLogConfiguration:
+    Type: AWS::NetworkFirewall::LoggingConfiguration
+    Properties:
+      FirewallArn: !Ref NetworkFirewall
+      LoggingConfiguration:
+        LogDestinationConfigs:
+          - LogType: FLOW
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: !Ref FirewallLogFlowGroup
+          - LogType: ALERT
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: !Ref FirewallLogAlertGroup
+
+  # --- 5. Route Tables and Routing Logic ---
+
+  # A. Route Table for the Protected Subnet (Outbound/Egress Traffic)
+  ProtectedSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-protected-egress-rt
+
+  AttachProtectedSubnetRT:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ProtectedSubnetA
+      RouteTableId: !Ref ProtectedSubnetRouteTable
+
+  # Route 1: Default Egress (Internet traffic) from Protected Subnet -> NFW Endpoint
+  ProtectedSubnetEgressRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref ProtectedSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      VpcEndpointId: !Select ["1", !Split [":", !Select ["0", !GetAtt NetworkFirewall.EndpointIds]]]
+
+  # Route 1b: Traffic from Protected Subnet to Public Subnet -> NFW Endpoint (FOR INSPECTION)
+  ProtectedToPublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref ProtectedSubnetRouteTable
+      DestinationCidrBlock: !Ref PublicSubnetBCIDR
+      VpcEndpointId: !Select ["1", !Split [":", !Select ["0", !GetAtt NetworkFirewall.EndpointIds]]]
+
+  # B. Route Table for the Public/Unprotected Subnet (Instance B)
+  PublicSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-public-unprotected-rt
+
+  AttachPublicSubnetRT:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicSubnetRouteTable
+
+  # Route 2: Default Egress (Internet traffic) from Public Subnet -> IGW (UNPROTECTED)
+  PublicSubnetInternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Crucial Route 3: Traffic destined for Protected Subnet (10.0.1.0/24) -> NFW Endpoint (FOR INSPECTION)
+  PublicToProtectedRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicSubnetRouteTable
+      DestinationCidrBlock: !Ref ProtectedSubnetACIDR
+      VpcEndpointId: !Select ["1", !Split [":", !Select ["0", !GetAtt NetworkFirewall.EndpointIds]]]
+
+  # C. Route Table for the Internet Gateway (Inbound/Ingress Traffic) - Routes to NFW
+  IGWRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-igw-ingress-rt
+
+  AttachIGWRouteTable:
+    Type: AWS::EC2::GatewayRouteTableAssociation
+    DependsOn: AttachGateway
+    Properties:
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref IGWRouteTable
+
+  # Route 4: Default Ingress (Internet traffic) from IGW -> NFW Endpoint
+  IGWIngressRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref IGWRouteTable
+      DestinationCidrBlock: !Ref ProtectedSubnetACIDR
+      VpcEndpointId: !Select ["1", !Split [":", !Select ["0", !GetAtt NetworkFirewall.EndpointIds]]]
+
+  # D. Route Table for the Firewall Subnet (Forwarding Inspected Traffic)
+  FirewallSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-firewall-rt
+
+  AttachFirewallSubnetRT:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref FirewallSubnetA
+      RouteTableId: !Ref FirewallSubnetRouteTable
+
+  # Route 5: Inspected Traffic to the Internet -> NAT Gateway
+  FirewallSubnetForwardInternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref FirewallSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  # --- 6. Security Group for EC2 Instances ---
+  InstanceBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: BastionHostSG
+      GroupDescription: Security group for Bastion Host - SSH access from internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+        Description: SSH access from anywhere
+      - IpProtocol: icmp
+        FromPort: -1
+        ToPort: -1
+        CidrIp: 0.0.0.0/0
+        Description: ICMP for connectivity testing
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-bastion-sg
+
+  InstanceASecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: UbuntuDesktop-SG
+      GroupDescription: Security group for Ubuntu Desktop - VPC internal access only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref VPCCIDR
+          Description: SSH from within VPC
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: !Ref VPCCIDR
+          Description: RDP from within VPC (xrdp)
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref VPCCIDR
+          Description: ICMP for connectivity testing
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic (filtered by Network Firewall)
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-ubuntu-desktop-sg
+
+  ApplicationKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub ${ProjectName}-generated-key
+      KeyType: rsa
+      KeyFormat: pem
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${ProjectName}-key-pair
+
+  #role for EC2 instances for systems manager
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-EC2InstanceRole"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      # The managed policy to allows the EC2 access to SSM permissions
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: CertBucketAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: 
+                 - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${SSMCertParameterName}'
+        - PolicyName: FirewallSwapAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - network-firewall:DescribeFirewall
+                  - network-firewall:DescribeFirewallPolicy
+                  - network-firewall:UpdateFirewallPolicy
+                  - network-firewall:AssociateFirewallPolicy
+                Resource: '*' # Or scope to your specific Firewall/Policy ARNs
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2InstanceRole
+  
+  # --- 7. EC2 Instances ---
+  # EC2 Instance A - Ubuntu Desktop (Protected in Private Subnet)
+  EC2InstanceA:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - NetworkFirewall
+      - FirewallSubnetRouteTable
+      - FirewallPolicy
+      - FirewallTLSConfiguration
+      - CertificateTrigger
+    Properties:
+      ImageId: !Ref AMI
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref ApplicationKeyPair
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeviceIndex: 0
+          GroupSet: [!Ref InstanceASecurityGroup]
+          SubnetId: !Ref ProtectedSubnetA
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub: ${ProjectName}-EC2Instance-A-Ubuntu-Desktop
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+
+          echo "Waiting for internet connectivity..."
+          # Loop up to 30 times, waiting 10 seconds each time (5 minutes max)
+          for i in {1..30}; do
+              if curl -s -I http://us-east-1.ec2.archive.ubuntu.com > /dev/null; then
+                  echo "Internet connection established."
+                  break
+              else
+                  echo "Waiting for network... ($i/30)"
+                  sleep 10
+              fi
+          done
+
+          echo "Starting Ubuntu Desktop setup at $(date)"
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Update system
+          apt-get update -y
+          apt-get upgrade -y
+
+          # Install Ubuntu Desktop environment (minimal)
+          apt-get install -y ubuntu-desktop
+
+          # Install common desktop tools
+
+          apt-get install -y \
+            firefox gnome-terminal gedit nautilus gnome-calculator \
+            gnome-system-monitor file-roller evince eog net-tools \
+            curl wget vim htop git unzip ca-certificates python3 \
+            python3-pip openssl xrdp
+
+          # Setup xrdp for remote desktop access
+          systemctl enable xrdp
+          systemctl start xrdp
+
+          # Configure xrdp to use GNOME
+          echo "gnome-session" > /etc/skel/.xsession
+
+          # Add ubuntu user to ssl-cert group for xrdp
+          usermod -a -G ssl-cert xrdp
+
+          # Download AWS CLI v2
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          ./aws/install
+
+          # Download ca.cert.pem from SSM Parameter Store
+          aws ssm get-parameter --name "${SSMCertParameterName}" --query "Parameter.Value" --output text --region ${AWS::Region} > /tmp/ca.cert.pem
+
+          # Load as trusted root certificate
+          cp /tmp/ca.cert.pem /usr/local/share/ca-certificates/firewall-ca.crt
+          update-ca-certificates
+
+          # Verify the installation
+          sudo openssl verify /usr/local/share/ca-certificates/firewall-ca.crt >> /var/log/cert-verify.log 2>&1
+
+          # Restart xrdp service
+          systemctl restart xrdp
+
+          echo "ubuntu:mysecret" | chpasswd
+
+          # Install Google Chrome
+          wget -q -O /tmp/google-chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          apt-get install -y /tmp/google-chrome.deb || apt-get install -f -y
+          rm -f /tmp/google-chrome.deb
+
+          # Install Claude CLI tool
+          bash -c 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash && export NVM_DIR="$HOME/.nvm" && [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" && nvm install 20 && nvm use 20 && npm install -g @anthropic-ai/claude-code'
+          export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/firewall-ca.crt
+
+          echo "Starting Policy Migration to TLS-enabled Policy..."
+
+          FIREWALL_NAME="${ProjectName}-firewall"
+          TARGET_POLICY_NAME="${ProjectName}-firewall-policy"
+          REGION="${AWS::Region}"
+          TARGET_POLICY_ARN=$(aws network-firewall describe-firewall-policy \
+              --firewall-policy-name "$TARGET_POLICY_NAME" \
+              --region "$REGION" \
+              --query 'FirewallPolicyResponse.FirewallPolicyArn' \
+              --output text)
+
+          # Network Firewall requires an UpdateToken to prevent concurrent modification issues
+          UPDATE_TOKEN=$(aws network-firewall describe-firewall \
+              --firewall-name "$FIREWALL_NAME" \
+              --region "$REGION" \
+              --query 'UpdateToken' \
+              --output text)
+
+          # Switch the NetworkFirewall to the already-existing 'FirewallPolicy'
+          aws network-firewall associate-firewall-policy \
+              --firewall-name "$FIREWALL_NAME" \
+              --update-token "$UPDATE_TOKEN" \
+              --firewall-policy-arn "$TARGET_POLICY_ARN" \
+              --region "$REGION"
+
+          echo "Firewall policy successfully migrated to $TARGET_POLICY_NAME at $(date)"
+          echo "Ubuntu Desktop setup completed at $(date)"
+
+  # Instance B - Bastion Host in Public Subnet (for accessing protected Instance A)
+  EC2InstanceB:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - EC2InstanceA
+    Properties:
+      ImageId: !Ref AMI
+      InstanceType: !Ref BastionInstanceType
+      KeyName: !Ref ApplicationKeyPair
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet: [!Ref InstanceBSecurityGroup]
+          SubnetId: !Ref PublicSubnetB
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub: ${ProjectName}-Bastion-Host
+        - Key: Purpose
+          Value: Bastion host for accessing protected EC2 Instance A
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+
+          echo "Starting Bastion Host setup at $(date)"
+
+          # Update system
+          apt-get update -y
+          apt-get upgrade -y
+
+          # Install essential tools for bastion host
+          apt-get install -y \
+            openssh-client net-tools curl wget \
+            vim htop awscli remmina remmina-plugin-rdp
+
+          # Configure SSH client for easier access to protected instances
+          cat >> /etc/ssh/ssh_config <<EOF
+          Host 10.0.*.*
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+          EOF
+
+          echo "Bastion Host setup completed at $(date)"
+
+# --- 8. Outputs ---
+Outputs:
+  VPCId:
+    Description: The ID of the new VPC.
+    Value: !Ref VPC
+  EC2InstanceAPrivateIP:
+    Description: Private IP of Ubuntu Desktop Instance A (connect via RDP from Bastion)
+    Value: !GetAtt EC2InstanceA.PrivateIp
+  BastionHostPublicIP:
+    Description: Public IP of Bastion Host (SSH entry point)
+    Value: !GetAtt EC2InstanceB.PublicIp
+  KeyName:
+    Description: Name of the created key pair
+    Value: !Ref ApplicationKeyPair
+  SSMParameterName:
+    Description: Name of the SSM Parameter holding the private key.
+    Value: !Sub "/ec2/keypair/${ApplicationKeyPair.KeyPairId}"
+  CategoryFilteringEnabled:
+    Description: 'Confirms AI/ML category filtering is enabled'
+    Value: 'Artificial Intelligence and Machine Learning'
+    Export:
+      Name: !Sub '${ProjectName}-CategoryFilter'
+  AcmIntermediateArn:
+    Value: !GetAtt CertificateTrigger.CertificateArn
+  SSMParameterPath:
+    Value: !Ref SSMCertParameterName
